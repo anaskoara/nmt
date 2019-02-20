@@ -264,6 +264,9 @@ def add_arguments(parser):
   # Inference
   parser.add_argument("--ckpt", type=str, default="",
                       help="Checkpoint file to load a model for inference.")
+  parser.add_argument("--dictionary", type=str, default="",
+                      help="Dictionary for unknown words to be translated.")
+
   parser.add_argument("--inference_input_file", type=str, default=None,
                       help="Set to the text to decode.")
   parser.add_argument("--inference_list", type=str, default=None,

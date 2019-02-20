@@ -28,7 +28,7 @@ __all__ = ["BatchedInput", "get_iterator", "get_infer_iterator"]
 # NOTE(ebrevdo): When we subclass this, instances' __dict__ becomes empty.
 class BatchedInput(
     collections.namedtuple("BatchedInput",
-                           ("initializer", "source", "target_input",
+                           ("initializer","source_words", "source", "target_input",
                             "target_output", "source_sequence_length",
                             "target_sequence_length"))):
   pass
@@ -56,7 +56,7 @@ def get_infer_iterator(src_dataset,
   else:
     # Convert the word strings to ids
     src_dataset = src_dataset.map(
-        lambda src: tf.cast(src_vocab_table.lookup(src), tf.int32))
+        lambda src: (src, tf.cast(src_vocab_table.lookup(src), tf.int32)))
 
   # Add in the word counts.
   if use_char_encode:
@@ -65,7 +65,7 @@ def get_infer_iterator(src_dataset,
                      tf.to_int32(
                          tf.size(src) / vocab_utils.DEFAULT_CHAR_MAXLEN)))
   else:
-    src_dataset = src_dataset.map(lambda src: (src, tf.size(src)))
+      src_dataset = src_dataset.map(lambda src_w, src_id: (src_w, src_id, tf.size(src_id)))
 
   def batching_func(x):
     return x.padded_batch(
@@ -74,20 +74,23 @@ def get_infer_iterator(src_dataset,
         # this has unknown-length vectors.  The last entry is
         # the source row size; this is a scalar.
         padded_shapes=(
-            tf.TensorShape([None]),  # src
+            tf.TensorShape([None]),  # src_words
+            tf.TensorShape([None]),  # src_ids
             tf.TensorShape([])),  # src_len
         # Pad the source sequences with eos tokens.
         # (Though notice we don't generally need to do this since
         # later on we will be masking out calculations past the true sequence.
         padding_values=(
+            "#",
             src_eos_id,  # src
             0))  # src_len -- unused
 
   batched_dataset = batching_func(src_dataset)
   batched_iter = batched_dataset.make_initializable_iterator()
-  (src_ids, src_seq_len) = batched_iter.get_next()
+  (src_words, src_ids, src_seq_len) = batched_iter.get_next()
   return BatchedInput(
       initializer=batched_iter.initializer,
+      source_words=src_words,
       source=src_ids,
       target_input=None,
       target_output=None,

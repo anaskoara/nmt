@@ -49,10 +49,18 @@ class EvalOutputTuple(collections.namedtuple(
 
 
 class InferOutputTuple(collections.namedtuple(
-    "InferOutputTuple", ("infer_logits", "infer_summary", "sample_id",
+    "InferOutputTuple", ("input_words","input_ids","infer_logits", "infer_summary", "sample_id",
                          "sample_words"))):
   """To allow for flexibily in returing different outputs."""
   pass
+
+
+def decode_utf8(input_words):
+    for a in input_words:
+        for i in range(len(a)):
+            a[i]=a[i].decode("utf-8")
+    return input_words
+
 
 
 class BaseModel(object):
@@ -68,6 +76,7 @@ class BaseModel(object):
                reverse_target_vocab_table=None,
                scope=None,
                extra_args=None):
+
     """Create the model.
 
     Args:
@@ -83,6 +92,7 @@ class BaseModel(object):
 
     """
     # Set params
+    self.hparams=hparams
     self._set_params_initializer(hparams, mode, iterator,
                                  source_vocab_table, target_vocab_table,
                                  scope, extra_args)
@@ -99,6 +109,9 @@ class BaseModel(object):
     # Saver
     self.saver = tf.train.Saver(
         tf.global_variables(), max_to_keep=hparams.num_keep_ckpts)
+
+    #dictionary
+    self.dictionary={}
 
   def _set_params_initializer(self,
                               hparams,
@@ -178,7 +191,7 @@ class BaseModel(object):
     elif self.mode == tf.contrib.learn.ModeKeys.EVAL:
       self.eval_loss = res[1]
     elif self.mode == tf.contrib.learn.ModeKeys.INFER:
-      self.infer_logits, _, self.final_context_state, self.sample_id = res
+      self.infer_logits, _, self.final_context_state, self.sample_id, self.encoder_inputs = res
       self.sample_words = reverse_target_vocab_table.lookup(
           tf.to_int64(self.sample_id))
 
@@ -345,6 +358,7 @@ class BaseModel(object):
                                    batch_size=self.batch_size)
     return sess.run(output_tuple)
 
+
   def build_graph(self, hparams, scope=None):
     """Subclass must implement this method.
 
@@ -382,7 +396,8 @@ class BaseModel(object):
         self.encoder_outputs = None
         encoder_state = None
       else:
-        self.encoder_outputs, encoder_state = self._build_encoder(hparams)
+        self.encoder_outputs, encoder_state, self.encoder_inputs, self.encoder_input_words = self._build_encoder(
+            hparams)
 
       # Skip decoder if extracting only encoder layers
       if self.extract_encoder_layers:
@@ -400,7 +415,7 @@ class BaseModel(object):
       else:
         loss = tf.constant(0.0)
 
-      return logits, loss, final_context_state, sample_id
+      return logits, loss, final_context_state, sample_id, self.encoder_inputs
 
   @abc.abstractmethod
   def _build_encoder(self, hparams):
@@ -672,12 +687,22 @@ class BaseModel(object):
     return tf.no_op()
 
   def infer(self, sess):
-    assert self.mode == tf.contrib.learn.ModeKeys.INFER
-    output_tuple = InferOutputTuple(infer_logits=self.infer_logits,
-                                    infer_summary=self.infer_summary,
-                                    sample_id=self.sample_id,
-                                    sample_words=self.sample_words)
-    return sess.run(output_tuple)
+      assert self.mode == tf.contrib.learn.ModeKeys.INFER
+      self._load_dictionary(self.hparams.dictionary)
+      output_tuple = InferOutputTuple(input_words=self.encoder_input_words, input_ids=self.encoder_inputs,
+                                      infer_logits=self.infer_logits,
+                                      infer_summary=self.infer_summary,
+                                      sample_id=self.sample_id,
+                                      sample_words=self.sample_words)
+      return sess.run(output_tuple)
+
+  def _load_dictionary(self,dictionary_file):
+      self.dictionary = {}
+      with open(dictionary_file) as f:
+          for line in f:
+              (key, val) = line.split()
+              self.dictionary[key.strip()] = val.strip()
+      return self.dictionary
 
   def decode(self, sess):
     """Decode a batch.
@@ -689,17 +714,29 @@ class BaseModel(object):
       A tuple consiting of outputs, infer_summary.
         outputs: of size [batch_size, time]
     """
+
     output_tuple = self.infer(sess)
+    input_words=decode_utf8(output_tuple.input_words)
+
+
     sample_words = output_tuple.sample_words
     infer_summary = output_tuple.infer_summary
-
+    sample_id=output_tuple.sample_id
+    print("=======================================")
+    #print(infer_summary)
+    print("=======================================")
     # make sure outputs is of shape [batch_size, time] or [beam_width,
     # batch_size, time] when using beam search.
     if self.time_major:
       sample_words = sample_words.transpose()
+      sample_id=sample_id.transpose()
     elif sample_words.ndim == 3:
       # beam search output in [batch_size, time, beam_width] shape.
       sample_words = sample_words.transpose([2, 0, 1])
+      sample_id = sample_words.sample_id([2, 0, 1])
+    for i in range(len(sample_id)):
+        if(0 in sample_id[i]):
+            sample_words[i]=self.replace_unk(sample_id[i],sample_words[i],input_words[i],infer_summary[i])
     return sample_words, infer_summary
 
   def build_encoder_states(self, include_embeddings=False):
@@ -717,6 +754,24 @@ class BaseModel(object):
 
     return stack_state_list
 
+  def replace_unk(self, sample_id,sample_word,input_words,infer_summary):
+      print(self)
+      #inference_summary src_seq_len, tgt_seq_len,1
+      for i in range(len(sample_id)):
+          if sample_id[i]==0:
+              max=0
+              index=0
+              for j in range(len(input_words)):
+                  if infer_summary[j][i][0]>max:
+                      max=infer_summary[j][i][0]
+                      index=j
+
+              sample_word[i]=bytes(self.dictionary.get(input_words[index], "unk "), 'utf-8')
+
+
+
+      return sample_word
+
 
 class Model(BaseModel):
   """Sequence-to-sequence dynamic model.
@@ -724,7 +779,15 @@ class Model(BaseModel):
   This class implements a multi-layer recurrent neural network as encoder,
   and a multi-layer recurrent neural network decoder.
   """
-  def _build_encoder_from_sequence(self, hparams, sequence, sequence_length):
+
+  def _build_encoder(self, hparams):
+      """Build encoder from source."""
+      utils.print_out("# Build a basic encoder")
+      return self._build_encoder_from_sequence(
+          hparams, self.iterator.source, self.iterator.source_sequence_length, self.iterator.source_words)
+
+
+  def _build_encoder_from_sequence(self, hparams, sequence, sequence_length,sequence_words):
     """Build an encoder from a sequence.
 
     Args:
@@ -795,13 +858,13 @@ class Model(BaseModel):
     # Use the top layer for now
     self.encoder_state_list = [encoder_outputs]
 
-    return encoder_outputs, encoder_state
+    return encoder_outputs, encoder_state, sequence, sequence_words
 
   def _build_encoder(self, hparams):
     """Build encoder from source."""
     utils.print_out("# Build a basic encoder")
     return self._build_encoder_from_sequence(
-        hparams, self.iterator.source, self.iterator.source_sequence_length)
+        hparams, self.iterator.source, self.iterator.source_sequence_length,self.iterator.source_words)
 
   def _build_bidirectional_rnn(self, inputs, sequence_length,
                                dtype, hparams,
